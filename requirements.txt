@@ -1,5 +1,6 @@
-streamlit
+streamlit==1.50.0
 pandas
+openpyxl
 folium
 streamlit-folium
-openpyxl
+geopy
