@@ -1,176 +1,188 @@
 import streamlit as st
 import pandas as pd
-from utils import (
-    haversine_km,
-    greedy_spatial_clustering,
-    find_centroid_pincode,
-    nearest_distance_to_workshops,
-)
-from streamlit_folium import st_folium
 import folium
-from folium import CircleMarker, Popup, Marker, Icon
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
+from geopy.distance import geodesic
+import math
+from io import BytesIO
 
-st.set_page_config(layout="wide", page_title="KMA Mahindra Workshop Planner")
+# ---------------------------
+# PAGE CONFIG
+# ---------------------------
+st.set_page_config(page_title="Mahindra Workshop Planning Tool - KMA Region", layout="wide")
 
-st.title("KMA Mahindra Workshop Planning Tool")
+st.title("🔧 Mahindra Workshop Planning Tool - KMA Region")
+st.markdown("""
+This tool helps visualize existing Mahindra workshops and identify potential new workshop locations 
+based on **F30 RO projections** and **distance constraints**.
+""")
 
-st.sidebar.header("Inputs / Controls")
-uploaded_workshops = st.sidebar.file_uploader("Upload Mahindra workshops Excel", type=["xlsx","xls"], key="w")
-uploaded_proj = st.sidebar.file_uploader("Upload F30 projections Excel", type=["xlsx","xls"], key="p")
+# ---------------------------
+# FILE INPUTS
+# ---------------------------
+st.sidebar.header("📂 Input Files")
 
-max_ro = st.sidebar.slider("Max RO per cluster", 1000, 10000, 6000, step=500)
-min_ro = st.sidebar.number_input("Min RO for cluster (informational)", value=5000, min_value=0)
-min_dist_km = st.sidebar.slider("Min distance from existing workshop (km)", 1, 20, 5)
+workshop_file = st.sidebar.file_uploader("Upload Workshop File", type=["xlsx"], key="workshop")
+projection_file = st.sidebar.file_uploader("Upload F30 Projection File", type=["xlsx"], key="projection")
 
-show_existing = st.sidebar.checkbox("Show existing workshops", value=True)
-show_clusters = st.sidebar.checkbox("Show clusters", value=True)
-show_suggested = st.sidebar.checkbox("Show suggested locations", value=True)
+# Default values
+max_ro_default = 6000
+min_dist_default = 5
 
-if uploaded_workshops and uploaded_proj:
+# ---------------------------
+# USER CONTROLS
+# ---------------------------
+st.sidebar.header("⚙️ Controls")
+max_ro = st.sidebar.slider("Max RO per Cluster", 1000, 10000, max_ro_default, step=500)
+min_distance_km = st.sidebar.slider("Min Distance from Existing Workshop (km)", 1, 10, min_dist_default, step=1)
+
+# ---------------------------
+# LOAD AND VALIDATE DATA
+# ---------------------------
+if workshop_file and projection_file:
     try:
-        ws_df = pd.read_excel(uploaded_workshops)
-        proj_df = pd.read_excel(uploaded_proj)
-    except Exception as e:
-        st.error(f"Error reading uploaded files: {e}")
-        st.stop()
+        df_workshops = pd.read_excel(workshop_file)
+        df_proj = pd.read_excel(projection_file)
 
-    st.subheader("Input file headers (detected)")
-    st.write("Workshops columns:", list(ws_df.columns))
-    st.write("Projections columns:", list(proj_df.columns))
+        # Normalize column names
+        df_workshops.columns = df_workshops.columns.str.strip()
+        df_proj.columns = df_proj.columns.str.strip()
 
-    # try to infer column names with common possibilities
-    # Workshops expected: workshop_name, pincode, latitude, longitude
-    # Projections expected: pincode, F30_ROs (or projected_ro), latitude, longitude, NRC_VIN_count
-    st.info("Make sure your files contain columns for pin code, latitude, longitude, and projected RO count (F30).")
+        # Use exact columns from your uploaded files
+        workshop_name_col = "Mabindra Workshop Location"
+        workshop_pincode_col = "Pincode"
+        proj_pincode_col = "Customer Pin Code"
+        proj_ro_col = "F30_RO_Projection"
 
-    # Standardize column names by lowercasing
-    ws = ws_df.copy()
-    proj = proj_df.copy()
-    ws.columns = [c.strip() if isinstance(c, str) else c for c in ws.columns]
-    proj.columns = [c.strip() if isinstance(c, str) else c for c in proj.columns]
-
-    # Try common column name matches
-    def find_col(df, candidates):
-        for c in candidates:
-            if c in df.columns:
-                return c
-        # try case-insensitive
-        low_map = {col.lower(): col for col in df.columns if isinstance(col, str)}
-        for c in candidates:
-            if c.lower() in low_map:
-                return low_map[c.lower()]
-        return None
-
-    ws_name_col = find_col(ws, ["workshop_name", "name", "dealer_name", "workshop", "dealer"])
-    ws_pincode_col = find_col(ws, ["pincode", "pin", "pin_code", "postalcode", "postal_code"])
-    ws_lat_col = find_col(ws, ["latitude","lat","y"])
-    ws_lon_col = find_col(ws, ["longitude","lon","lng","long","x"])
-
-    proj_pincode_col = find_col(proj, ["pincode", "pin", "pin_code", "postalcode", "postal_code"])
-    proj_lat_col = find_col(proj, ["latitude","lat","y"])
-    proj_lon_col = find_col(proj, ["longitude","lon","lng","long","x"])
-    proj_ro_col = find_col(proj, ["F30_ROs","F30_RO","F30_RO_projection","projected_ro","projected_ros","projected_ro_count","projected_ro_count","f30_ro","f30_ro_projection","f30_projection","projected_ro_count","projected_ro"])
-
-    missing = []
-    for name, col in [
-        ("workshop name", ws_name_col),
-        ("workshop pincode", ws_pincode_col),
-        ("workshop latitude", ws_lat_col),
-        ("workshop longitude", ws_lon_col),
-        ("proj pincode", proj_pincode_col),
-        ("proj latitude", proj_lat_col),
-        ("proj longitude", proj_lon_col),
-        ("proj projected RO", proj_ro_col),
-    ]:
-        if col is None:
-            missing.append(name)
-    if missing:
-        st.warning("Could not confidently detect these columns: " + ", ".join(missing))
-        st.stop()
-
-    # rename for internal use
-    ws = ws.rename(columns={ws_name_col: "workshop_name", ws_pincode_col: "pincode", ws_lat_col: "lat", ws_lon_col: "lon"})
-    proj = proj.rename(columns={proj_pincode_col: "pincode", proj_lat_col: "lat", proj_lon_col: "lon", proj_ro_col: "projected_ro"})
-
-    # keep numeric columns properly cast
-    proj["projected_ro"] = pd.to_numeric(proj["projected_ro"], errors="coerce").fillna(0)
-    proj["lat"] = pd.to_numeric(proj["lat"], errors="coerce")
-    proj["lon"] = pd.to_numeric(proj["lon"], errors="coerce")
-    ws["lat"] = pd.to_numeric(ws["lat"], errors="coerce")
-    ws["lon"] = pd.to_numeric(ws["lon"], errors="coerce")
-
-    # drop rows missing coords
-    proj = proj.dropna(subset=["lat","lon"])
-    ws = ws.dropna(subset=["lat","lon"])
-
-    # clustering
-    clusters = greedy_spatial_clustering(proj, max_ro=max_ro)
-    st.write(f"Formed {len(clusters)} clusters (max_ro={max_ro})")
-
-    # Build folium map centered at mean location
-    center_lat = float(proj["lat"].mean())
-    center_lon = float(proj["lon"].mean())
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=8)
-
-    if show_clusters:
-        # draw cluster markers and popups
-        for i, c in enumerate(clusters, start=1):
-            members = c["members"]
-            total_ro = c["total_ro"]
-            centroid = c["centroid"]
-            # draw small circle at centroid
-            popup_html = f"Cluster {i}<br/>Total RO: {int(total_ro)}<br/>Members: {len(members)}"
-            CircleMarker(location=[centroid[0], centroid[1]], radius=8, fill=True, fill_opacity=0.9, popup=Popup(popup_html)).add_to(m)
-            # draw lines to members
-            for _, row in members.iterrows():
-                folium.PolyLine(locations=[[centroid[0], centroid[1]],[row["lat"], row["lon"]]], weight=1).add_to(m)
-
-    if show_existing:
-        for _, r in ws.iterrows():
-            tooltip = f"{r.get('workshop_name','')} (Pincode: {r.get('pincode','')})"
-            Marker(location=[r["lat"], r["lon"]], tooltip=tooltip, icon=Icon(color="red",icon="wrench", prefix='fa')).add_to(m)
-
-    # suggested locations: centroid pincode of each cluster, then filter by min_dist_km
-    suggested = []
-    for i, c in enumerate(clusters, start=1):
-        centroid = c["centroid"]
-        centroid_pincode, centroid_lat, centroid_lon = find_centroid_pincode(c["members"], centroid)
-        dist_to_nearest = nearest_distance_to_workshops(centroid_lat, centroid_lon, ws)
-        is_far = dist_to_nearest >= min_dist_km
-        suggested.append({
-            "cluster_id": i,
-            "centroid_pincode": centroid_pincode,
-            "centroid_lat": centroid_lat,
-            "centroid_lon": centroid_lon,
-            "total_ro": c["total_ro"],
-            "dist_to_nearest_workshop_km": dist_to_nearest,
-            "suggested": is_far
+        # Rename for clarity
+        df_workshops = df_workshops.rename(columns={
+            workshop_name_col: "Workshop",
+            workshop_pincode_col: "Workshop_Pincode",
+            "Latitude": "Workshop_Lat",
+            "Longitude": "Workshop_Lon"
         })
-    suggested_df = pd.DataFrame(suggested)
-    st.subheader("Suggested Locations (centroid pincode per cluster)")
-    st.write(suggested_df)
 
-    if show_suggested:
-        for _, s in suggested_df[suggested_df["suggested"]].iterrows():
-            popup = f"Cluster {s['cluster_id']}<br/>RO: {int(s['total_ro'])}<br/>Pincode: {s['centroid_pincode']}<br/>Dist to nearest WS: {s['dist_to_nearest_workshop_km']:.2f} km"
-            Marker(location=[s["centroid_lat"], s["centroid_lon"]], tooltip=popup, icon=Icon(color="green", icon="plus", prefix='fa')).add_to(m)
+        df_proj = df_proj.rename(columns={
+            proj_pincode_col: "Proj_Pincode",
+            "Latitude": "Proj_Lat",
+            "Longitude": "Proj_Lon",
+            proj_ro_col: "Proj_RO"
+        })
 
-    # show map
-    st_data = st_folium(m, width=1000, height=600)
+        # ---------------------------
+        # CLUSTERING LOGIC
+        # ---------------------------
+        df_proj = df_proj.sort_values("Proj_RO", ascending=False).reset_index(drop=True)
+        clusters = []
+        current_cluster = []
+        current_sum = 0
+        cluster_id = 1
 
-    # export suggested and cluster summary
-    st.subheader("Export")
-    csv = suggested_df.to_csv(index=False).encode('utf-8')
-    st.download_button("Download suggested locations CSV", data=csv, file_name="suggested_locations.csv", mime="text/csv")
-    # cluster details
-    all_clusters = []
-    for i, c in enumerate(clusters, start=1):
-        members = c["members"].copy()
-        members["cluster_id"] = i
-        members["cluster_total_ro"] = c["total_ro"]
-        all_clusters.append(members)
-    all_clusters_df = pd.concat(all_clusters, ignore_index=True)
-    st.download_button("Download clusters detail CSV", data=all_clusters_df.to_csv(index=False).encode('utf-8'), file_name="clusters_detail.csv", mime="text/csv")
+        for _, row in df_proj.iterrows():
+            if current_sum + row["Proj_RO"] <= max_ro or current_sum == 0:
+                current_cluster.append(row)
+                current_sum += row["Proj_RO"]
+            else:
+                clusters.append(pd.DataFrame(current_cluster).assign(Cluster_ID=f"Cluster_{cluster_id}"))
+                cluster_id += 1
+                current_cluster = [row]
+                current_sum = row["Proj_RO"]
+
+        # Add remaining
+        if current_cluster:
+            clusters.append(pd.DataFrame(current_cluster).assign(Cluster_ID=f"Cluster_{cluster_id}"))
+
+        df_clusters = pd.concat(clusters, ignore_index=True)
+
+        # ---------------------------
+        # CALCULATE CLUSTER CENTROIDS
+        # ---------------------------
+        centroids = (
+            df_clusters.groupby("Cluster_ID")
+            .agg({"Proj_Lat": "mean", "Proj_Lon": "mean", "Proj_RO": "sum"})
+            .reset_index()
+        )
+
+        # ---------------------------
+        # FILTER EXISTING WORKSHOPS (DISTANCE)
+        # ---------------------------
+        suggested_locations = []
+        for _, row in centroids.iterrows():
+            cluster_latlon = (row["Proj_Lat"], row["Proj_Lon"])
+            too_close = False
+            for _, ws in df_workshops.iterrows():
+                dist = geodesic(cluster_latlon, (ws["Workshop_Lat"], ws["Workshop_Lon"])).km
+                if dist < min_distance_km:
+                    too_close = True
+                    break
+            if not too_close:
+                suggested_locations.append(row)
+
+        df_suggested = pd.DataFrame(suggested_locations)
+
+        # ---------------------------
+        # MAP VISUALIZATION
+        # ---------------------------
+        st.subheader("🗺️ Interactive Map")
+
+        map_center = [df_proj["Proj_Lat"].mean(), df_proj["Proj_Lon"].mean()]
+        m = folium.Map(location=map_center, zoom_start=7)
+
+        # Existing Workshops
+        if st.sidebar.checkbox("Show Existing Workshops", value=True):
+            for _, row in df_workshops.iterrows():
+                folium.Marker(
+                    [row["Workshop_Lat"], row["Workshop_Lon"]],
+                    popup=f"🏭 {row['Workshop']}<br>Pincode: {row['Workshop_Pincode']}",
+                    icon=folium.Icon(color="red", icon="wrench", prefix="fa")
+                ).add_to(m)
+
+        # Clusters
+        if st.sidebar.checkbox("Show Clusters", value=True):
+            marker_cluster = MarkerCluster().add_to(m)
+            for _, row in df_clusters.iterrows():
+                folium.CircleMarker(
+                    [row["Proj_Lat"], row["Proj_Lon"]],
+                    radius=4,
+                    color="blue",
+                    fill=True,
+                    fill_opacity=0.6,
+                    popup=f"Cluster: {row['Cluster_ID']}<br>ROs: {row['Proj_RO']}"
+                ).add_to(marker_cluster)
+
+        # Suggested Locations
+        if not df_suggested.empty and st.sidebar.checkbox("Show Suggested Locations", value=True):
+            for _, row in df_suggested.iterrows():
+                folium.Marker(
+                    [row["Proj_Lat"], row["Proj_Lon"]],
+                    popup=f"🟢 Suggested New Workshop<br>ROs: {int(row['Proj_RO'])}<br>Cluster: {row['Cluster_ID']}",
+                    icon=folium.Icon(color="green", icon="plus", prefix="fa")
+                ).add_to(m)
+
+        st_folium(m, width=1200, height=700)
+
+        # ---------------------------
+        # SUMMARY TABLES
+        # ---------------------------
+        st.subheader("📊 Cluster Summary")
+        st.dataframe(centroids.rename(columns={"Proj_RO": "Total_ROs"}))
+
+        # Export
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df_suggested.to_excel(writer, index=False, sheet_name="Suggested_Locations")
+            centroids.to_excel(writer, index=False, sheet_name="Cluster_Summary")
+
+        st.download_button(
+            label="📥 Download Suggested Locations (Excel)",
+            data=buffer.getvalue(),
+            file_name="Suggested_Workshop_Locations.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except Exception as e:
+        st.error(f"❌ Error processing files: {e}")
 
 else:
-    st.info("Please upload both required Excel files in the sidebar.")
+    st.info("⬆️ Please upload both Excel files to begin.")
